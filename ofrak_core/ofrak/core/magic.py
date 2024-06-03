@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Union
@@ -63,14 +64,18 @@ class MagicAnalyzer(Analyzer[None, Magic]):
     outputs = (Magic,)
     external_dependencies = (LIBMAGIC_DEP,)
 
+    @staticmethod
+    def _analyze(data: bytes) -> Magic:
+        magic_mime = magic.from_buffer(data, mime=True)
+        magic_description = magic.from_buffer(data)
+        return Magic(magic_mime, magic_description)
+
     async def analyze(self, resource: Resource, config=None) -> Magic:
         data = await resource.get_data()
         if not MAGIC_INSTALLED:
             raise ComponentMissingDependencyError(self, LIBMAGIC_DEP)
         else:
-            magic_mime = magic.from_buffer(data, mime=True)
-            magic_description = magic.from_buffer(data)
-            return Magic(magic_mime, magic_description)
+            return await asyncio.get_running_loop().run_in_executor(None, self._analyze, data)
 
 
 class MagicMimeIdentifier(Identifier[None]):
