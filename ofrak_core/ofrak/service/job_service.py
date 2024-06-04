@@ -1,8 +1,9 @@
 import asyncio
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
+import time
 from typing import (
     Awaitable,
     Dict,
@@ -65,7 +66,7 @@ from ofrak_type.error import NotFoundError
 TargetCache = Dict[ResourceTag, List[ComponentInterface]]
 LOGGER = logging.getLogger(__name__)
 
-MAX_CONCURRENT_COMPONENTS = 512
+MAX_CONCURRENT_COMPONENTS = 1
 
 ANALYZERS_FILTER = ComponentTypeFilter(Analyzer)  # type: ignore
 IDENTIFIERS_FILTER = ComponentTypeFilter(Identifier)  # type: ignore
@@ -81,6 +82,51 @@ _RunTaskResultT = Tuple[Union[ComponentRunResult, BaseException], M]
 class _ComponentAutoRunRequest:
     target_resource_id: bytes
     component_filter: ComponentFilter
+
+
+@dataclass
+class TimingResult:
+    min: int = 1_000_000_000_000_000_000_000_000_000_000
+    max: int = -1
+    max_resource: bytes = b""
+    total: int = 0
+
+    def update(self, t: int, resource_id: bytes) -> None:
+        self.total += t
+        if t > self.max:
+            self.max = t
+            self.max_resource = resource_id
+        if t < self.min:
+            self.min = t
+
+    @staticmethod
+    def mystrtime(ns: int) -> str:
+        if ns > 1_000_000_000:
+            return f"{ns/1_000_000_000:.2f}s"
+        else:
+            return f"{ns/1_000_000:.1f}ms"
+
+    def str(self, n):
+        return f"{self.mystrtime(self.total)}: {self.mystrtime(self.min)}--{self.mystrtime(self.max)} per call, {self.mystrtime(self.total/n)} avg, max at {self.max_resource.hex()}"
+
+
+@dataclass
+class TimingResults:
+    n: int = 0
+    wall: TimingResult = field(default_factory=TimingResult)
+    cpu: TimingResult = field(default_factory=TimingResult)
+    select: TimingResult = field(default_factory=TimingResult)
+    block: TimingResult = field(default_factory=TimingResult)
+
+    def update(self, resource_id: bytes, wall: int, cpu: int, select: int, block: int) -> None:
+        self.n += 1
+        self.wall.update(wall, resource_id)
+        self.cpu.update(cpu, resource_id)
+        self.select.update(select, resource_id)
+        self.block.update(block, resource_id)
+
+    def __str__(self):
+        return f"{self.n} total calls:\n\tWall: {self.wall.str(self.n)}\n\tCPU: {self.cpu.str(self.n)}\n\tasyncio select: {self.select.str(self.n)}\n\tBlocking IO:{self.block.str(self.n)}"
 
 
 class JobService(JobServiceInterface):
@@ -99,6 +145,8 @@ class JobService(JobServiceInterface):
 
         self._active_component_tasks: Dict[Tuple[bytes, bytes], Awaitable[_RunTaskResultT]] = dict()
         self._num_runners = 0
+
+        self._timing: Dict[bytes, TimingResults] = defaultdict(TimingResults)
 
     async def create_job(self, id: bytes, name: str) -> JobModel:
         model = JobModel(id, name)
@@ -130,6 +178,9 @@ class JobService(JobServiceInterface):
         fresh_resource_context = self._resource_context_factory.create()
         fresh_resource_view_context = ResourceViewContext()
         result: Union[ComponentRunResult, BaseException]
+        start_select_time = asyncio.get_event_loop()._selector.select_time
+        start_perf = time.perf_counter_ns()
+        start_process = time.process_time_ns()
         try:
             result = await component.run(
                 job_id,
@@ -139,11 +190,36 @@ class JobService(JobServiceInterface):
                 fresh_resource_view_context,
                 config,
             )
-            _log_component_run_result_info(job_id, resource_id, component, result)
         except Exception as e:
             result = e
+        end_perf = time.perf_counter_ns()
+        end_process = time.process_time_ns()
+        end_select_time = asyncio.get_event_loop()._selector.select_time
+        blocked_time = max(
+            0,
+            end_perf
+            - start_perf
+            - end_process
+            + start_process
+            - end_select_time
+            + start_select_time,
+        )
+        _log_component_run_result_info(job_id, resource_id, component, result)
+        self._timing[component.get_id()].update(
+            resource_id,
+            end_perf - start_perf,
+            end_process - start_process,
+            end_select_time - start_select_time,
+            blocked_time,
+        )
 
         return result, metadata
+
+    def print_stats(self):
+        for component_id in sorted(
+            self._timing.keys(), key=lambda k: self._timing[k].block.total, reverse=True
+        ):
+            print(f"Component {component_id.decode()}: {self._timing[component_id]}")
 
     def clear_cache(self, resource_id: bytes, component_id: bytes) -> None:
         component_task_id = (resource_id, component_id)
